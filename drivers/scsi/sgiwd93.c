@@ -226,7 +226,7 @@ static struct scsi_host_template sgiwd93_template = {
 	.use_clustering		= DISABLE_CLUSTERING,
 };
 
-static int __devinit sgiwd93_probe(struct platform_device *pdev)
+static int sgiwd93_probe(struct platform_device *pdev)
 {
 	struct sgiwd93_platform_data *pd = pdev->dev.platform_data;
 	unsigned char *wdregs = pd->wdregs;
@@ -249,8 +249,8 @@ static int __devinit sgiwd93_probe(struct platform_device *pdev)
 
 	hdata = host_to_hostdata(host);
 	hdata->dev = &pdev->dev;
-	hdata->cpu = dma_alloc_noncoherent(&pdev->dev, HPC_DMA_SIZE,
-					   &hdata->dma, GFP_KERNEL);
+	hdata->cpu = dma_alloc_attrs(&pdev->dev, HPC_DMA_SIZE, &hdata->dma,
+				     GFP_KERNEL, DMA_ATTR_NON_CONSISTENT);
 	if (!hdata->cpu) {
 		printk(KERN_WARNING "sgiwd93: Could not allocate memory for "
 		       "host %d buffer.\n", unit);
@@ -289,7 +289,8 @@ static int __devinit sgiwd93_probe(struct platform_device *pdev)
 out_irq:
 	free_irq(irq, host);
 out_free:
-	dma_free_noncoherent(&pdev->dev, HPC_DMA_SIZE, hdata->cpu, hdata->dma);
+	dma_free_attrs(&pdev->dev, HPC_DMA_SIZE, hdata->cpu, hdata->dma,
+		       DMA_ATTR_NON_CONSISTENT);
 out_put:
 	scsi_host_put(host);
 out:
@@ -297,7 +298,7 @@ out:
 	return err;
 }
 
-static int __exit sgiwd93_remove(struct platform_device *pdev)
+static int sgiwd93_remove(struct platform_device *pdev)
 {
 	struct Scsi_Host *host = platform_get_drvdata(pdev);
 	struct ip22_hostdata *hdata = (struct ip22_hostdata *) host->hostdata;
@@ -305,17 +306,17 @@ static int __exit sgiwd93_remove(struct platform_device *pdev)
 
 	scsi_remove_host(host);
 	free_irq(pd->irq, host);
-	dma_free_noncoherent(&pdev->dev, HPC_DMA_SIZE, hdata->cpu, hdata->dma);
+	dma_free_attrs(&pdev->dev, HPC_DMA_SIZE, hdata->cpu, hdata->dma,
+		       DMA_ATTR_NON_CONSISTENT);
 	scsi_host_put(host);
 	return 0;
 }
 
 static struct platform_driver sgiwd93_driver = {
 	.probe  = sgiwd93_probe,
-	.remove = __devexit_p(sgiwd93_remove),
+	.remove = sgiwd93_remove,
 	.driver = {
 		.name   = "sgiwd93",
-		.owner	= THIS_MODULE,
 	}
 };
 

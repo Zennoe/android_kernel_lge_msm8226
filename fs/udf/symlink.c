@@ -20,14 +20,13 @@
  */
 
 #include "udfdecl.h"
-#include <asm/uaccess.h>
+#include <linux/uaccess.h>
 #include <linux/errno.h>
 #include <linux/fs.h>
 #include <linux/time.h>
 #include <linux/mm.h>
 #include <linux/stat.h>
 #include <linux/pagemap.h>
-#include <linux/buffer_head.h>
 #include "udf_i.h"
 
 static int udf_pc_to_char(struct super_block *sb, unsigned char *from,
@@ -42,14 +41,17 @@ static int udf_pc_to_char(struct super_block *sb, unsigned char *from,
 	tolen--;
 	while (elen < fromlen) {
 		pc = (struct pathComponent *)(from + elen);
+		elen += sizeof(struct pathComponent);
 		switch (pc->componentType) {
 		case 1:
 			/*
 			 * Symlink points to some place which should be agreed
  			 * upon between originator and receiver of the media. Ignore.
 			 */
-			if (pc->lengthComponentIdent > 0)
+			if (pc->lengthComponentIdent > 0) {
+				elen += pc->lengthComponentIdent;
 				break;
+			}
 			/* Fall through */
 		case 2:
 			if (tolen == 0)
@@ -74,9 +76,21 @@ static int udf_pc_to_char(struct super_block *sb, unsigned char *from,
 			/* that would be . - just ignore */
 			break;
 		case 5:
+<<<<<<< HEAD
 			comp_len = udf_get_filename(sb, pc->componentIdent,
 						    pc->lengthComponentIdent,
 						    p, tolen);
+=======
+			elen += pc->lengthComponentIdent;
+			if (elen > fromlen)
+				return -EIO;
+			comp_len = udf_get_filename(sb, pc->componentIdent,
+						    pc->lengthComponentIdent,
+						    p, tolen);
+			if (comp_len < 0)
+				return comp_len;
+
+>>>>>>> v4.13
 			p += comp_len;
 			tolen -= comp_len;
 			if (tolen == 0)
@@ -85,7 +99,6 @@ static int udf_pc_to_char(struct super_block *sb, unsigned char *from,
 			tolen--;
 			break;
 		}
-		elen += sizeof(struct pathComponent) + pc->lengthComponentIdent;
 	}
 	if (p > to + 1)
 		p[-1] = '\0';
@@ -99,10 +112,16 @@ static int udf_symlink_filler(struct file *file, struct page *page)
 	struct inode *inode = page->mapping->host;
 	struct buffer_head *bh = NULL;
 	unsigned char *symlink;
-	int err = -EIO;
-	unsigned char *p = kmap(page);
+	int err;
+	unsigned char *p = page_address(page);
 	struct udf_inode_info *iinfo;
 	uint32_t pos;
+
+	/* We don't support symlinks longer than one block */
+	if (inode->i_size > inode->i_sb->s_blocksize) {
+		err = -ENAMETOOLONG;
+		goto out_unmap;
+	}
 
 	iinfo = UDF_I(inode);
 	pos = udf_block_map(inode, 0);
@@ -113,8 +132,10 @@ static int udf_symlink_filler(struct file *file, struct page *page)
 	} else {
 		bh = sb_bread(inode->i_sb, pos);
 
-		if (!bh)
-			goto out;
+		if (!bh) {
+			err = -EIO;
+			goto out_unlock_inode;
+		}
 
 		symlink = bh->b_data;
 	}
@@ -126,16 +147,41 @@ static int udf_symlink_filler(struct file *file, struct page *page)
 
 	up_read(&iinfo->i_data_sem);
 	SetPageUptodate(page);
-	kunmap(page);
 	unlock_page(page);
 	return 0;
 
-out:
+out_unlock_inode:
 	up_read(&iinfo->i_data_sem);
 	SetPageError(page);
-	kunmap(page);
+out_unmap:
 	unlock_page(page);
 	return err;
+}
+
+static int udf_symlink_getattr(const struct path *path, struct kstat *stat,
+				u32 request_mask, unsigned int flags)
+{
+	struct dentry *dentry = path->dentry;
+	struct inode *inode = d_backing_inode(dentry);
+	struct page *page;
+
+	generic_fillattr(inode, stat);
+	page = read_mapping_page(inode->i_mapping, 0, NULL);
+	if (IS_ERR(page))
+		return PTR_ERR(page);
+	/*
+	 * UDF uses non-trivial encoding of symlinks so i_size does not match
+	 * number of characters reported by readlink(2) which apparently some
+	 * applications expect. Also POSIX says that "The value returned in the
+	 * st_size field shall be the length of the contents of the symbolic
+	 * link, and shall not count a trailing null if one is present." So
+	 * let's report the length of string returned by readlink(2) for
+	 * st_size.
+	 */
+	stat->size = strlen(page_address(page));
+	put_page(page);
+
+	return 0;
 }
 
 /*
@@ -143,4 +189,9 @@ out:
  */
 const struct address_space_operations udf_symlink_aops = {
 	.readpage		= udf_symlink_filler,
+};
+
+const struct inode_operations udf_symlink_inode_operations = {
+	.get_link	= page_get_link,
+	.getattr	= udf_symlink_getattr,
 };

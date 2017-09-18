@@ -11,6 +11,10 @@
  * 2 of the Licence, or (at your option) any later version.
  */
 //#define DEBUG
+<<<<<<< HEAD
+=======
+#include <linux/rcupdate.h>
+>>>>>>> v4.13
 #include <linux/slab.h>
 #include <linux/err.h>
 #include <linux/assoc_array_priv.h>

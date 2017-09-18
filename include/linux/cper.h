@@ -22,6 +22,7 @@
 #define LINUX_CPER_H
 
 #include <linux/uuid.h>
+#include <linux/trace_seq.h>
 
 /* CPER record signature and the size */
 #define CPER_SIG_RECORD				"CPER"
@@ -35,6 +36,13 @@
  */
 #define CPER_RECORD_REV				0x0100
 
+/*
+ * CPER record length contains the CPER fields which are relevant for further
+ * handling of a memory error in userspace (we don't carry all the fields
+ * defined in the UEFI spec because some of them don't make any sense.)
+ * Currently, a length of 256 should be more than enough.
+ */
+#define CPER_REC_LEN					256
 /*
  * Severity difinition for error_severity in struct cper_record_header
  * and section_severity in struct cper_section_descriptor
@@ -172,6 +180,10 @@ enum {
 #define CPER_SEC_PROC_IPF						\
 	UUID_LE(0xE429FAF1, 0x3CB7, 0x11D4, 0x0B, 0xCA, 0x07, 0x00,	\
 		0x80, 0xC7, 0x3C, 0x88, 0x81)
+/* Processor Specific: ARM */
+#define CPER_SEC_PROC_ARM						\
+	UUID_LE(0xE19E3D16, 0xBC11, 0x11E4, 0x9C, 0xAA, 0xC2, 0x05,	\
+		0x1D, 0x5D, 0x46, 0xB0)
 /* Platform Memory */
 #define CPER_SEC_PLATFORM_MEM						\
 	UUID_LE(0xA5BC1114, 0x6F64, 0x4EDE, 0xB8, 0x63, 0x3E, 0x83,	\
@@ -218,8 +230,8 @@ enum {
 #define CPER_PROC_VALID_IP			0x1000
 
 #define CPER_MEM_VALID_ERROR_STATUS		0x0001
-#define CPER_MEM_VALID_PHYSICAL_ADDRESS		0x0002
-#define CPER_MEM_VALID_PHYSICAL_ADDRESS_MASK	0x0004
+#define CPER_MEM_VALID_PA			0x0002
+#define CPER_MEM_VALID_PA_MASK			0x0004
 #define CPER_MEM_VALID_NODE			0x0008
 #define CPER_MEM_VALID_CARD			0x0010
 #define CPER_MEM_VALID_MODULE			0x0020
@@ -232,6 +244,9 @@ enum {
 #define CPER_MEM_VALID_RESPONDER_ID		0x1000
 #define CPER_MEM_VALID_TARGET_ID		0x2000
 #define CPER_MEM_VALID_ERROR_TYPE		0x4000
+#define CPER_MEM_VALID_RANK_NUMBER		0x8000
+#define CPER_MEM_VALID_CARD_HANDLE		0x10000
+#define CPER_MEM_VALID_MODULE_HANDLE		0x20000
 
 #define CPER_PCIE_VALID_PORT_TYPE		0x0001
 #define CPER_PCIE_VALID_VERSION			0x0002
@@ -243,6 +258,22 @@ enum {
 #define CPER_PCIE_VALID_AER_INFO		0x0080
 
 #define CPER_PCIE_SLOT_SHIFT			3
+
+#define CPER_ARM_VALID_MPIDR			BIT(0)
+#define CPER_ARM_VALID_AFFINITY_LEVEL		BIT(1)
+#define CPER_ARM_VALID_RUNNING_STATE		BIT(2)
+#define CPER_ARM_VALID_VENDOR_INFO		BIT(3)
+
+#define CPER_ARM_INFO_VALID_MULTI_ERR		BIT(0)
+#define CPER_ARM_INFO_VALID_FLAGS		BIT(1)
+#define CPER_ARM_INFO_VALID_ERR_INFO		BIT(2)
+#define CPER_ARM_INFO_VALID_VIRT_ADDR		BIT(3)
+#define CPER_ARM_INFO_VALID_PHYSICAL_ADDR	BIT(4)
+
+#define CPER_ARM_INFO_FLAGS_FIRST		BIT(0)
+#define CPER_ARM_INFO_FLAGS_LAST		BIT(1)
+#define CPER_ARM_INFO_FLAGS_PROPAGATED		BIT(2)
+#define CPER_ARM_INFO_FLAGS_OVERFLOW		BIT(3)
 
 /*
  * All tables and structs must be byte-packed to match CPER
@@ -329,7 +360,61 @@ struct cper_ia_proc_ctx {
 	__u64	mm_reg_addr;
 };
 
-/* Memory Error Section */
+/* ARM Processor Error Section */
+struct cper_sec_proc_arm {
+	__u32	validation_bits;
+	__u16	err_info_num;		/* Number of Processor Error Info */
+	__u16	context_info_num;	/* Number of Processor Context Info Records*/
+	__u32	section_length;
+	__u8	affinity_level;
+	__u8	reserved[3];		/* must be zero */
+	__u64	mpidr;
+	__u64	midr;
+	__u32	running_state;		/* Bit 0 set - Processor running. PSCI = 0 */
+	__u32	psci_state;
+};
+
+/* ARM Processor Error Information Structure */
+struct cper_arm_err_info {
+	__u8	version;
+	__u8	length;
+	__u16	validation_bits;
+	__u8	type;
+	__u16	multiple_error;
+	__u8	flags;
+	__u64	error_info;
+	__u64	virt_fault_addr;
+	__u64	physical_fault_addr;
+};
+
+/* ARM Processor Context Information Structure */
+struct cper_arm_ctx_info {
+	__u16	version;
+	__u16	type;
+	__u32	size;
+};
+
+/* Old Memory Error Section UEFI 2.1, 2.2 */
+struct cper_sec_mem_err_old {
+	__u64	validation_bits;
+	__u64	error_status;
+	__u64	physical_addr;
+	__u64	physical_addr_mask;
+	__u16	node;
+	__u16	card;
+	__u16	module;
+	__u16	bank;
+	__u16	device;
+	__u16	row;
+	__u16	column;
+	__u16	bit_pos;
+	__u64	requestor_id;
+	__u64	responder_id;
+	__u64	target_id;
+	__u8	error_type;
+};
+
+/* Memory Error Section UEFI >= 2.3 */
 struct cper_sec_mem_err {
 	__u64	validation_bits;
 	__u64	error_status;
@@ -347,6 +432,28 @@ struct cper_sec_mem_err {
 	__u64	responder_id;
 	__u64	target_id;
 	__u8	error_type;
+	__u8	reserved;
+	__u16	rank;
+	__u16	mem_array_handle;	/* card handle in UEFI 2.4 */
+	__u16	mem_dev_handle;		/* module handle in UEFI 2.4 */
+};
+
+struct cper_mem_err_compact {
+	__u64	validation_bits;
+	__u16	node;
+	__u16	card;
+	__u16	module;
+	__u16	bank;
+	__u16	device;
+	__u16	row;
+	__u16	column;
+	__u16	bit_pos;
+	__u64	requestor_id;
+	__u64	responder_id;
+	__u64	target_id;
+	__u16	rank;
+	__u16	mem_array_handle;
+	__u16	mem_dev_handle;
 };
 
 struct cper_sec_pcie {
@@ -388,7 +495,13 @@ struct cper_sec_pcie {
 #pragma pack()
 
 u64 cper_next_record_id(void);
+const char *cper_severity_str(unsigned int);
+const char *cper_mem_err_type_str(unsigned int);
 void cper_print_bits(const char *prefix, unsigned int bits,
-		     const char *strs[], unsigned int strs_size);
+		     const char * const strs[], unsigned int strs_size);
+void cper_mem_err_pack(const struct cper_sec_mem_err *,
+		       struct cper_mem_err_compact *);
+const char *cper_mem_err_unpack(struct trace_seq *,
+				struct cper_mem_err_compact *);
 
 #endif

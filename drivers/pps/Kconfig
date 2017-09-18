@@ -2,11 +2,8 @@
 # PPS support configuration
 #
 
-menu "PPS support"
-
-config PPS
+menuconfig PPS
 	tristate "PPS support"
-	depends on EXPERIMENTAL
 	---help---
 	  PPS (Pulse Per Second) is a special pulse provided by some GPS
 	  antennae. Userland can use it to get a high-precision time
@@ -32,7 +29,7 @@ config PPS_DEBUG
 
 config NTP_PPS
 	bool "PPS kernel consumer support"
-	depends on PPS && !NO_HZ
+	depends on PPS && !NO_HZ_COMMON
 	help
 	  This option adds support for direct in-kernel time
 	  synchronization using an external PPS signal.
@@ -42,5 +39,3 @@ config NTP_PPS
 source drivers/pps/clients/Kconfig
 
 source drivers/pps/generators/Kconfig
-
-endmenu

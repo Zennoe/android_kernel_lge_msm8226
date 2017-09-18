@@ -9,44 +9,23 @@
  * published by the Free Software Foundation.
  */
 
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/init.h>
-#include <linux/list.h>
-#include <linux/spinlock.h>
-#include <linux/device.h>
-#include <linux/timer.h>
-#include <linux/err.h>
 #include <linux/ctype.h>
+#include <linux/device.h>
+#include <linux/err.h>
+#include <linux/init.h>
+#include <linux/kernel.h>
 #include <linux/leds.h>
+#include <linux/list.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
+#include <linux/timer.h>
+#include <uapi/linux/uleds.h>
 #include "leds.h"
-#if defined(CONFIG_MACH_LGE)
-#include <mach/board_lge.h>
-#endif
-
-#define LED_BUFF_SIZE 50
 
 static struct class *leds_class;
-#ifdef CONFIG_LEDS_PM8226_EMOTIONAL
-extern void make_onoff_led_pattern(int rgb);
-extern void change_led_pattern(int pattern);
-extern void make_input_led_pattern(int patterns[],
-			int red_start, int red_length, int red_duty,
-			int red_pause, int green_start, int green_length,
-			int green_duty,	int green_pause, int blue_start,
-			int blue_length, int blue_duty, int blue_pause,
-			int red_flag, int green_flag, int blue_flag,
-			int period);
-static int onoff_rgb = 0;
-extern void change_led_mode(void);
-#endif
-static void led_update_brightness(struct led_classdev *led_cdev)
-{
-	if (led_cdev->brightness_get)
-		led_cdev->brightness = led_cdev->brightness_get(led_cdev);
-}
 
-static ssize_t led_brightness_show(struct device *dev, 
+static ssize_t brightness_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
 	struct led_classdev *led_cdev = dev_get_drvdata(dev);
@@ -54,137 +33,137 @@ static ssize_t led_brightness_show(struct device *dev,
 	/* no lock needed for this */
 	led_update_brightness(led_cdev);
 
-	return snprintf(buf, LED_BUFF_SIZE, "%u\n", led_cdev->brightness);
+	return sprintf(buf, "%u\n", led_cdev->brightness);
 }
 
-static ssize_t led_brightness_store(struct device *dev,
+static ssize_t brightness_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t size)
 {
 	struct led_classdev *led_cdev = dev_get_drvdata(dev);
-	ssize_t ret = -EINVAL;
-	char *after;
-	unsigned long state = simple_strtoul(buf, &after, 10);
-	size_t count = after - buf;
+	unsigned long state;
+	ssize_t ret;
 
-#ifdef CONFIG_LEDS_PM8226_EMOTIONAL
-	if(lge_get_boot_mode() != LGE_BOOT_MODE_CHARGERLOGO) {
-		if (!strncmp(led_cdev->name, "red", 3)){
-			change_led_mode();
-		}
-	}
-#endif
+	mutex_lock(&led_cdev->led_access);
 
-	if (isspace(*after))
-		count++;
-
-	if (count == size) {
-		ret = count;
-
-		if (state == LED_OFF)
-			led_trigger_remove(led_cdev);
-		led_set_brightness(led_cdev, state);
+	if (led_sysfs_is_disabled(led_cdev)) {
+		ret = -EBUSY;
+		goto unlock;
 	}
 
+	ret = kstrtoul(buf, 10, &state);
+	if (ret)
+		goto unlock;
+
+	if (state == LED_OFF)
+		led_trigger_remove(led_cdev);
+	led_set_brightness(led_cdev, state);
+
+	ret = size;
+unlock:
+	mutex_unlock(&led_cdev->led_access);
 	return ret;
 }
+static DEVICE_ATTR_RW(brightness);
 
-static ssize_t led_max_brightness_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t size)
-{
-	struct led_classdev *led_cdev = dev_get_drvdata(dev);
-	ssize_t ret = -EINVAL;
-	unsigned long state = 0;
-
-	ret = strict_strtoul(buf, 10, &state);
-	if (!ret) {
-		ret = size;
-		if (state > LED_FULL)
-			state = LED_FULL;
-		led_cdev->max_brightness = state;
-		led_set_brightness(led_cdev, led_cdev->brightness);
-	}
-
-	return ret;
-}
-
-static ssize_t led_max_brightness_show(struct device *dev,
+static ssize_t max_brightness_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
 	struct led_classdev *led_cdev = dev_get_drvdata(dev);
 
-	return snprintf(buf, LED_BUFF_SIZE, "%u\n", led_cdev->max_brightness);
+	return sprintf(buf, "%u\n", led_cdev->max_brightness);
 }
+static DEVICE_ATTR_RO(max_brightness);
 
-#ifdef CONFIG_LGE_PM_VZW_CHARGING_TEMP_SCENARIO
-static int lge_thm_status = 0;
-static ssize_t thermald_status_show(struct device *dev,
-		                struct device_attribute *attr, char *buf)
-{
-        return sprintf(buf, "%d\n",lge_thm_status);
-}
-
-static ssize_t thermald_status_store(struct device *dev,
-		                struct device_attribute *attr, const char *buf, size_t size)
-{
-        struct led_classdev *led_cdev = dev_get_drvdata(dev);
-        unsigned long state = 0;
-        int rc = 1;
-
-	if (strncmp(buf, "0", 1) == 0)
-		lge_thm_status = 0;
-	else if (strncmp(buf, "1", 1) == 0) {
-		state = LED_FULL;
-		led_cdev->max_brightness = state;
-		led_set_brightness(led_cdev, led_cdev->brightness);
-
-		lge_thm_status = 1;
-	}
-	return rc;
-}
-#endif
-
-static struct device_attribute led_class_attrs[] = {
-	__ATTR(brightness, 0644, led_brightness_show, led_brightness_store),
-	__ATTR(max_brightness, 0644, led_max_brightness_show,
-			led_max_brightness_store),
-#ifdef CONFIG_LGE_PM_VZW_CHARGING_TEMP_SCENARIO
-	__ATTR(thermald_status, 0644, thermald_status_show, thermald_status_store),
-#endif
 #ifdef CONFIG_LEDS_TRIGGERS
-	__ATTR(trigger, 0644, led_trigger_show, led_trigger_store),
+static DEVICE_ATTR(trigger, 0644, led_trigger_show, led_trigger_store);
+static struct attribute *led_trigger_attrs[] = {
+	&dev_attr_trigger.attr,
+	NULL,
+};
+static const struct attribute_group led_trigger_group = {
+	.attrs = led_trigger_attrs,
+};
 #endif
-	__ATTR_NULL,
+
+static struct attribute *led_class_attrs[] = {
+	&dev_attr_brightness.attr,
+	&dev_attr_max_brightness.attr,
+	NULL,
 };
 
-static void led_timer_function(unsigned long data)
+static const struct attribute_group led_group = {
+	.attrs = led_class_attrs,
+};
+
+static const struct attribute_group *led_groups[] = {
+	&led_group,
+#ifdef CONFIG_LEDS_TRIGGERS
+	&led_trigger_group,
+#endif
+	NULL,
+};
+
+#ifdef CONFIG_LEDS_BRIGHTNESS_HW_CHANGED
+static ssize_t brightness_hw_changed_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
 {
-	struct led_classdev *led_cdev = (void *)data;
-	unsigned long brightness;
-	unsigned long delay;
+	struct led_classdev *led_cdev = dev_get_drvdata(dev);
 
-	if (!led_cdev->blink_delay_on || !led_cdev->blink_delay_off) {
-		led_set_brightness(led_cdev, LED_OFF);
-		return;
-	}
+	if (led_cdev->brightness_hw_changed == -1)
+		return -ENODATA;
 
-	brightness = led_get_brightness(led_cdev);
-	if (!brightness) {
-		/* Time to switch the LED on. */
-		brightness = led_cdev->blink_brightness;
-		delay = led_cdev->blink_delay_on;
-	} else {
-		/* Store the current brightness value to be able
-		 * to restore it when the delay_off period is over.
-		 */
-		led_cdev->blink_brightness = brightness;
-		brightness = LED_OFF;
-		delay = led_cdev->blink_delay_off;
-	}
-
-	led_set_brightness(led_cdev, brightness);
-
-	mod_timer(&led_cdev->blink_timer, jiffies + msecs_to_jiffies(delay));
+	return sprintf(buf, "%u\n", led_cdev->brightness_hw_changed);
 }
+
+static DEVICE_ATTR_RO(brightness_hw_changed);
+
+static int led_add_brightness_hw_changed(struct led_classdev *led_cdev)
+{
+	struct device *dev = led_cdev->dev;
+	int ret;
+
+	ret = device_create_file(dev, &dev_attr_brightness_hw_changed);
+	if (ret) {
+		dev_err(dev, "Error creating brightness_hw_changed\n");
+		return ret;
+	}
+
+	led_cdev->brightness_hw_changed_kn =
+		sysfs_get_dirent(dev->kobj.sd, "brightness_hw_changed");
+	if (!led_cdev->brightness_hw_changed_kn) {
+		dev_err(dev, "Error getting brightness_hw_changed kn\n");
+		device_remove_file(dev, &dev_attr_brightness_hw_changed);
+		return -ENXIO;
+	}
+
+	return 0;
+}
+
+static void led_remove_brightness_hw_changed(struct led_classdev *led_cdev)
+{
+	sysfs_put(led_cdev->brightness_hw_changed_kn);
+	device_remove_file(led_cdev->dev, &dev_attr_brightness_hw_changed);
+}
+
+void led_classdev_notify_brightness_hw_changed(struct led_classdev *led_cdev,
+					       enum led_brightness brightness)
+{
+	if (WARN_ON(!led_cdev->brightness_hw_changed_kn))
+		return;
+
+	led_cdev->brightness_hw_changed = brightness;
+	sysfs_notify_dirent(led_cdev->brightness_hw_changed_kn);
+}
+EXPORT_SYMBOL_GPL(led_classdev_notify_brightness_hw_changed);
+#else
+static int led_add_brightness_hw_changed(struct led_classdev *led_cdev)
+{
+	return 0;
+}
+static void led_remove_brightness_hw_changed(struct led_classdev *led_cdev)
+{
+}
+#endif
 
 /**
  * led_classdev_suspend - suspend an led_classdev.
@@ -193,7 +172,7 @@ static void led_timer_function(unsigned long data)
 void led_classdev_suspend(struct led_classdev *led_cdev)
 {
 	led_cdev->flags |= LED_SUSPENDED;
-	led_cdev->brightness_set(led_cdev, 0);
+	led_set_brightness_nopm(led_cdev, 0);
 }
 EXPORT_SYMBOL_GPL(led_classdev_suspend);
 
@@ -203,12 +182,17 @@ EXPORT_SYMBOL_GPL(led_classdev_suspend);
  */
 void led_classdev_resume(struct led_classdev *led_cdev)
 {
-	led_cdev->brightness_set(led_cdev, led_cdev->brightness);
+	led_set_brightness_nopm(led_cdev, led_cdev->brightness);
+
+	if (led_cdev->flash_resume)
+		led_cdev->flash_resume(led_cdev);
+
 	led_cdev->flags &= ~LED_SUSPENDED;
 }
 EXPORT_SYMBOL_GPL(led_classdev_resume);
 
-static int led_suspend(struct device *dev, pm_message_t state)
+#ifdef CONFIG_PM_SLEEP
+static int led_suspend(struct device *dev)
 {
 	struct led_classdev *led_cdev = dev_get_drvdata(dev);
 
@@ -227,22 +211,81 @@ static int led_resume(struct device *dev)
 
 	return 0;
 }
+#endif
+
+static SIMPLE_DEV_PM_OPS(leds_class_dev_pm_ops, led_suspend, led_resume);
+
+static int match_name(struct device *dev, const void *data)
+{
+	if (!dev_name(dev))
+		return 0;
+	return !strcmp(dev_name(dev), (char *)data);
+}
+
+static int led_classdev_next_name(const char *init_name, char *name,
+				  size_t len)
+{
+	unsigned int i = 0;
+	int ret = 0;
+	struct device *dev;
+
+	strlcpy(name, init_name, len);
+
+	while ((ret < len) &&
+	       (dev = class_find_device(leds_class, NULL, name, match_name))) {
+		put_device(dev);
+		ret = snprintf(name, len, "%s_%u", init_name, ++i);
+	}
+
+	if (ret >= len)
+		return -ENOMEM;
+
+	return i;
+}
 
 /**
- * led_classdev_register - register a new object of led_classdev class.
- * @parent: The device to register.
+ * of_led_classdev_register - register a new object of led_classdev class.
+ *
+ * @parent: parent of LED device
  * @led_cdev: the led_classdev structure for this device.
+ * @np: DT node describing this LED
  */
-int led_classdev_register(struct device *parent, struct led_classdev *led_cdev)
+int of_led_classdev_register(struct device *parent, struct device_node *np,
+			    struct led_classdev *led_cdev)
 {
-	led_cdev->dev = device_create(leds_class, parent, 0, led_cdev,
-				      "%s", led_cdev->name);
+	char name[LED_MAX_NAME_SIZE];
+	int ret;
+
+	ret = led_classdev_next_name(led_cdev->name, name, sizeof(name));
+	if (ret < 0)
+		return ret;
+
+	led_cdev->dev = device_create_with_groups(leds_class, parent, 0,
+				led_cdev, led_cdev->groups, "%s", name);
 	if (IS_ERR(led_cdev->dev))
 		return PTR_ERR(led_cdev->dev);
+	led_cdev->dev->of_node = np;
 
+	if (ret)
+		dev_warn(parent, "Led %s renamed to %s due to name collision",
+				led_cdev->name, dev_name(led_cdev->dev));
+
+	if (led_cdev->flags & LED_BRIGHT_HW_CHANGED) {
+		ret = led_add_brightness_hw_changed(led_cdev);
+		if (ret) {
+			device_unregister(led_cdev->dev);
+			return ret;
+		}
+	}
+
+	led_cdev->work_flags = 0;
 #ifdef CONFIG_LEDS_TRIGGERS
 	init_rwsem(&led_cdev->trigger_lock);
 #endif
+#ifdef CONFIG_LEDS_BRIGHTNESS_HW_CHANGED
+	led_cdev->brightness_hw_changed = -1;
+#endif
+	mutex_init(&led_cdev->led_access);
 	/* add to the list of leds */
 	down_write(&leds_list_lock);
 	list_add_tail(&led_cdev->node, &leds_list);
@@ -253,187 +296,18 @@ int led_classdev_register(struct device *parent, struct led_classdev *led_cdev)
 
 	led_update_brightness(led_cdev);
 
-	init_timer(&led_cdev->blink_timer);
-	led_cdev->blink_timer.function = led_timer_function;
-	led_cdev->blink_timer.data = (unsigned long)led_cdev;
+	led_init_core(led_cdev);
 
 #ifdef CONFIG_LEDS_TRIGGERS
 	led_trigger_set_default(led_cdev);
 #endif
 
-	printk(KERN_DEBUG "Registered led device: %s\n",
+	dev_dbg(parent, "Registered led device: %s\n",
 			led_cdev->name);
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(led_classdev_register);
-
-#ifdef CONFIG_LEDS_PM8226_EMOTIONAL
-static ssize_t get_pattern(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	int count = 0;
-//	count = sprintf(buf,"%d %d\n", pattern_num,pattern_on );
-
-	return count;
-}
-
-static ssize_t set_pattern(struct device *dev, struct device_attribute *attr, const char *buf, size_t size)
-{
-	ssize_t ret = -EINVAL;
-	int pattern_num = 0;
-
-	if (sscanf(buf, "%d", &pattern_num) != 1) {
-		printk("[RGB LED] bad arguments ");
-	}
-	ret = size;
-
-	if(lge_get_boot_mode() <= LGE_BOOT_MODE_CHARGERLOGO) {
-		printk("[RGB LED] pattern_num=%d\n", pattern_num);
-		if (pattern_num != 35)
-			change_led_pattern(pattern_num);
-	}
-
-	return ret;
-}
-
-static DEVICE_ATTR(setting, 0664, get_pattern, set_pattern);
-
-static ssize_t get_input_pattern(struct device *dev,
-						struct device_attribute *attr,
-						char *buf)
-{
-	int count = 0;
-	return count;
-}
-
-static ssize_t set_input_pattern(struct device *dev,
-						struct device_attribute *attr,
-						const char *buf, size_t size)
-{
-	ssize_t ret = -EINVAL;
-	int patterns[63];
-
-	int red_start_idx;
-	int red_length;
-	int red_duty;
-	int red_pause_lo;
-
-	int green_start_idx;
-	int green_length;
-	int green_duty;
-	int green_pause_lo;
-
-	int blue_start_idx;
-	int blue_length;
-	int blue_duty;
-	int blue_pause_lo;
-
-	int red_flag;
-	int green_flag;
-	int blue_flag;
-	int period;
-
-	int i = 0;
-
-	if (sscanf(buf, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
-			&patterns[0], &patterns[1], &patterns[2],
-			&patterns[3], &patterns[4], &patterns[5],
-			&patterns[6], &patterns[7],	&patterns[8],
-			&patterns[9], &patterns[10], &patterns[11],
-			&patterns[12], &patterns[13], &patterns[14],
-			&patterns[15], &patterns[16], &patterns[17],
-			&patterns[18], &patterns[19], &patterns[20],
-			&patterns[21], &patterns[22], &patterns[23],
-			&patterns[24], &patterns[25], &patterns[26],
-			&patterns[27], &patterns[28], &patterns[29],
-			&patterns[30], &patterns[31], &patterns[32],
-			&patterns[33], &patterns[34], &patterns[35],
-			&patterns[36], &patterns[37], &patterns[38],
-			&patterns[39], &patterns[40], &patterns[41],
-			&patterns[42], &patterns[43], &patterns[44],
-			&patterns[45], &patterns[46], &patterns[47],
-			&patterns[48], &patterns[49], &patterns[50],
-			&patterns[51], &patterns[52], &patterns[53],
-			&patterns[54], &patterns[55], &patterns[56],
-			&patterns[57], &patterns[58], &patterns[59],
-			&patterns[60], &patterns[61], &patterns[62],
-			&red_start_idx, &red_length, &red_duty,
-			&red_pause_lo, &green_start_idx, &green_length,
-			&green_duty, &green_pause_lo, &blue_start_idx,
-			&blue_length,  &blue_duty,  &blue_pause_lo,
-			&red_flag, &green_flag, &blue_flag, &period) != 79){
-			printk(KERN_INFO "[RGB LED] bad arguments ");
-		}
-	ret = size;
-
-	printk("[RGB LED] LUT is \n");
-	for (i = 0; i < ARRAY_SIZE(patterns); i++)
-		printk(KERN_INFO "%d ", patterns[i]);
-	printk("\n");
-	printk(KERN_INFO "[RGB LED] [RED] duty_ms:%d, pause_lo:%d, start:%d, length:%d \n",
-		   red_duty, red_pause_lo, red_start_idx, red_length);
-	printk(KERN_INFO "[RGB LED] [FLAG] red:%d, green:%d, blue:%d\n",
-		   red_flag, green_flag, blue_flag);
-	make_input_led_pattern((int *)&patterns, red_start_idx, red_length,
-			red_duty, red_pause_lo, green_start_idx, green_length,
-			green_duty, green_pause_lo, blue_start_idx, blue_length,
-			blue_duty, blue_pause_lo, red_flag, green_flag,
-			blue_flag, period);
-
-	return ret;
-}
-
-static DEVICE_ATTR(input_patterns, 0664, get_input_pattern, set_input_pattern);
-
-static ssize_t confirm_onoff_pattern(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	return snprintf(buf, LED_BUFF_SIZE, "0x%06x\n", onoff_rgb);
-}
-
-static ssize_t make_onoff_pattern(struct device *dev, struct device_attribute *attr, const char *buf, size_t size)
-{
-
-	ssize_t ret = -EINVAL;
-
-	if (sscanf(buf, "0x%06x", &onoff_rgb) != 1)
-		printk("[RGB LED] make_onoff_pattern() bad arguments ");
-
-	ret = size;
-
-	//printk("[RGB LED] make_onoff_rgb is %06x\n",rgb);
-	make_onoff_led_pattern(onoff_rgb);
-
-	return ret;
-}
-
-static DEVICE_ATTR(onoff_patterns, 0664, confirm_onoff_pattern, make_onoff_pattern);
-
-
-int led_pattern_sysfs_register(void)
-{
-	struct class *jag_rgb;
-	struct device *pattern_sysfs_dev;
-	jag_rgb = class_create(THIS_MODULE, "one_color_led");
-	if (IS_ERR(jag_rgb)) {
-		printk("Failed to create class(one_color_led)!\n");
-	}
-	pattern_sysfs_dev = device_create(jag_rgb, NULL, 0, NULL, "use_patterns");
-	if (IS_ERR(pattern_sysfs_dev))
-		return PTR_ERR(pattern_sysfs_dev);
-
-	if (device_create_file(pattern_sysfs_dev, &dev_attr_setting) < 0)
-		printk("Failed to create device file(%s)!\n", dev_attr_setting.attr.name);
-
-	if (device_create_file(pattern_sysfs_dev, &dev_attr_input_patterns) < 0)
-		printk("Failed to create device file(%s)!\n", dev_attr_input_patterns.attr.name);
-
-	if (device_create_file(pattern_sysfs_dev, &dev_attr_onoff_patterns) < 0)
-		printk("Failed to create device file(%s)!\n", dev_attr_onoff_patterns.attr.name);
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(led_pattern_sysfs_register);
-#endif
+EXPORT_SYMBOL_GPL(of_led_classdev_register);
 
 /**
  * led_classdev_unregister - unregisters a object of led_properties class.
@@ -450,37 +324,94 @@ void led_classdev_unregister(struct led_classdev *led_cdev)
 	up_write(&led_cdev->trigger_lock);
 #endif
 
+	led_cdev->flags |= LED_UNREGISTERING;
+
 	/* Stop blinking */
-	led_brightness_set(led_cdev, LED_OFF);
+	led_stop_software_blink(led_cdev);
+
+	led_set_brightness(led_cdev, LED_OFF);
+
+	flush_work(&led_cdev->set_brightness_work);
+
+	if (led_cdev->flags & LED_BRIGHT_HW_CHANGED)
+		led_remove_brightness_hw_changed(led_cdev);
 
 	device_unregister(led_cdev->dev);
 
 	down_write(&leds_list_lock);
 	list_del(&led_cdev->node);
 	up_write(&leds_list_lock);
+
+	mutex_destroy(&led_cdev->led_access);
 }
 EXPORT_SYMBOL_GPL(led_classdev_unregister);
 
+static void devm_led_classdev_release(struct device *dev, void *res)
+{
+	led_classdev_unregister(*(struct led_classdev **)res);
+}
+
+/**
+ * devm_of_led_classdev_register - resource managed led_classdev_register()
+ *
+ * @parent: parent of LED device
+ * @led_cdev: the led_classdev structure for this device.
+ */
+int devm_of_led_classdev_register(struct device *parent,
+				  struct device_node *np,
+				  struct led_classdev *led_cdev)
+{
+	struct led_classdev **dr;
+	int rc;
+
+	dr = devres_alloc(devm_led_classdev_release, sizeof(*dr), GFP_KERNEL);
+	if (!dr)
+		return -ENOMEM;
+
+	rc = of_led_classdev_register(parent, np, led_cdev);
+	if (rc) {
+		devres_free(dr);
+		return rc;
+	}
+
+	*dr = led_cdev;
+	devres_add(parent, dr);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(devm_of_led_classdev_register);
+
+static int devm_led_classdev_match(struct device *dev, void *res, void *data)
+{
+	struct led_cdev **p = res;
+
+	if (WARN_ON(!p || !*p))
+		return 0;
+
+	return *p == data;
+}
+
+/**
+ * devm_led_classdev_unregister() - resource managed led_classdev_unregister()
+ * @parent: The device to unregister.
+ * @led_cdev: the led_classdev structure for this device.
+ */
+void devm_led_classdev_unregister(struct device *dev,
+				  struct led_classdev *led_cdev)
+{
+	WARN_ON(devres_release(dev,
+			       devm_led_classdev_release,
+			       devm_led_classdev_match, led_cdev));
+}
+EXPORT_SYMBOL_GPL(devm_led_classdev_unregister);
+
 static int __init leds_init(void)
 {
-#ifdef CONFIG_MACH_LGE
-#ifdef CONFIG_MACH_MSM8926_B2L_ATT
-	hw_rev_type hw_rev;
-	hw_rev = lge_get_board_revno();
-#endif
-#endif
 	leds_class = class_create(THIS_MODULE, "leds");
 	if (IS_ERR(leds_class))
 		return PTR_ERR(leds_class);
-	leds_class->suspend = led_suspend;
-	leds_class->resume = led_resume;
-	leds_class->dev_attrs = led_class_attrs;
-#ifdef CONFIG_LEDS_PM8226_EMOTIONAL
-#ifdef CONFIG_MACH_MSM8926_B2L_ATT
-	if(HW_REV_A < hw_rev)
-#endif
-	led_pattern_sysfs_register();
-#endif
+	leds_class->pm = &leds_class_dev_pm_ops;
+	leds_class->dev_groups = led_groups;
 	return 0;
 }
 

@@ -1,4 +1,5 @@
 ashldi3.S
+bswapsdi2.S
 font.c
 lib1funcs.S
 piggy.gzip
@@ -7,6 +8,8 @@ piggy.lz4
 piggy.lzma
 piggy.xzkern
 piggy.lz4
+hyp-stub.S
+piggy_data
 vmlinux
 vmlinux.lds
 

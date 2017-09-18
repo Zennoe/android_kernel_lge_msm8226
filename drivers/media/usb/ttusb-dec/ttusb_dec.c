@@ -1428,3 +1428,390 @@ static int ttusb_dec_boot_dsp(struct ttusb_dec *dec)
 	release_firmware(fw_entry);
 	kfree(b);
 
+<<<<<<< HEAD
+=======
+	return result;
+}
+
+static int ttusb_dec_init_stb(struct ttusb_dec *dec)
+{
+	int result;
+	unsigned int mode = 0, model = 0, version = 0;
+
+	dprintk("%s\n", __func__);
+
+	result = ttusb_dec_get_stb_state(dec, &mode, &model, &version);
+	if (result)
+		return result;
+
+	if (!mode) {
+		if (version == 0xABCDEFAB)
+			printk(KERN_INFO "ttusb_dec: no version info in Firmware\n");
+		else
+			printk(KERN_INFO "ttusb_dec: Firmware %x.%02x%c%c\n",
+			       version >> 24, (version >> 16) & 0xff,
+			       (version >> 8) & 0xff, version & 0xff);
+
+		result = ttusb_dec_boot_dsp(dec);
+		if (result)
+			return result;
+	} else {
+		/* We can't trust the USB IDs that some firmwares
+		   give the box */
+		switch (model) {
+		case 0x00070001:
+		case 0x00070008:
+		case 0x0007000c:
+			ttusb_dec_set_model(dec, TTUSB_DEC3000S);
+			break;
+		case 0x00070009:
+		case 0x00070013:
+			ttusb_dec_set_model(dec, TTUSB_DEC2000T);
+			break;
+		case 0x00070011:
+			ttusb_dec_set_model(dec, TTUSB_DEC2540T);
+			break;
+		default:
+			printk(KERN_ERR "%s: unknown model returned by firmware (%08x) - please report\n",
+			       __func__, model);
+			return -ENOENT;
+		}
+		if (version >= 0x01770000)
+			dec->can_playback = 1;
+	}
+	return 0;
+}
+
+static int ttusb_dec_init_dvb(struct ttusb_dec *dec)
+{
+	int result;
+
+	dprintk("%s\n", __func__);
+
+	if ((result = dvb_register_adapter(&dec->adapter,
+					   dec->model_name, THIS_MODULE,
+					   &dec->udev->dev,
+					   adapter_nr)) < 0) {
+		printk("%s: dvb_register_adapter failed: error %d\n",
+		       __func__, result);
+
+		return result;
+	}
+
+	dec->demux.dmx.capabilities = DMX_TS_FILTERING | DMX_SECTION_FILTERING;
+
+	dec->demux.priv = (void *)dec;
+	dec->demux.filternum = 31;
+	dec->demux.feednum = 31;
+	dec->demux.start_feed = ttusb_dec_start_feed;
+	dec->demux.stop_feed = ttusb_dec_stop_feed;
+	dec->demux.write_to_decoder = NULL;
+
+	if ((result = dvb_dmx_init(&dec->demux)) < 0) {
+		printk("%s: dvb_dmx_init failed: error %d\n", __func__,
+		       result);
+
+		dvb_unregister_adapter(&dec->adapter);
+
+		return result;
+	}
+
+	dec->dmxdev.filternum = 32;
+	dec->dmxdev.demux = &dec->demux.dmx;
+	dec->dmxdev.capabilities = 0;
+
+	if ((result = dvb_dmxdev_init(&dec->dmxdev, &dec->adapter)) < 0) {
+		printk("%s: dvb_dmxdev_init failed: error %d\n",
+		       __func__, result);
+
+		dvb_dmx_release(&dec->demux);
+		dvb_unregister_adapter(&dec->adapter);
+
+		return result;
+	}
+
+	dec->frontend.source = DMX_FRONTEND_0;
+
+	if ((result = dec->demux.dmx.add_frontend(&dec->demux.dmx,
+						  &dec->frontend)) < 0) {
+		printk("%s: dvb_dmx_init failed: error %d\n", __func__,
+		       result);
+
+		dvb_dmxdev_release(&dec->dmxdev);
+		dvb_dmx_release(&dec->demux);
+		dvb_unregister_adapter(&dec->adapter);
+
+		return result;
+	}
+
+	if ((result = dec->demux.dmx.connect_frontend(&dec->demux.dmx,
+						      &dec->frontend)) < 0) {
+		printk("%s: dvb_dmx_init failed: error %d\n", __func__,
+		       result);
+
+		dec->demux.dmx.remove_frontend(&dec->demux.dmx, &dec->frontend);
+		dvb_dmxdev_release(&dec->dmxdev);
+		dvb_dmx_release(&dec->demux);
+		dvb_unregister_adapter(&dec->adapter);
+
+		return result;
+	}
+
+	dvb_net_init(&dec->adapter, &dec->dvb_net, &dec->demux.dmx);
+
+	return 0;
+}
+
+static void ttusb_dec_exit_dvb(struct ttusb_dec *dec)
+{
+	dprintk("%s\n", __func__);
+
+	dvb_net_release(&dec->dvb_net);
+	dec->demux.dmx.close(&dec->demux.dmx);
+	dec->demux.dmx.remove_frontend(&dec->demux.dmx, &dec->frontend);
+	dvb_dmxdev_release(&dec->dmxdev);
+	dvb_dmx_release(&dec->demux);
+	if (dec->fe) {
+		dvb_unregister_frontend(dec->fe);
+		if (dec->fe->ops.release)
+			dec->fe->ops.release(dec->fe);
+	}
+	dvb_unregister_adapter(&dec->adapter);
+}
+
+static void ttusb_dec_exit_rc(struct ttusb_dec *dec)
+{
+	dprintk("%s\n", __func__);
+
+	if (dec->rc_input_dev) {
+		input_unregister_device(dec->rc_input_dev);
+		dec->rc_input_dev = NULL;
+	}
+}
+
+
+static void ttusb_dec_exit_usb(struct ttusb_dec *dec)
+{
+	int i;
+
+	dprintk("%s\n", __func__);
+
+	if (enable_rc) {
+		/* we have to check whether the irq URB is already submitted.
+		 * As the irq is submitted after the interface is changed,
+		 * this is the best method i figured out.
+		 * Any others?*/
+		if (dec->interface == TTUSB_DEC_INTERFACE_IN)
+			usb_kill_urb(dec->irq_urb);
+
+		usb_free_urb(dec->irq_urb);
+
+		usb_free_coherent(dec->udev, IRQ_PACKET_SIZE,
+				  dec->irq_buffer, dec->irq_dma_handle);
+	}
+
+	dec->iso_stream_count = 0;
+
+	for (i = 0; i < ISO_BUF_COUNT; i++)
+		usb_kill_urb(dec->iso_urb[i]);
+
+	ttusb_dec_free_iso_urbs(dec);
+}
+
+static void ttusb_dec_exit_tasklet(struct ttusb_dec *dec)
+{
+	struct list_head *item;
+	struct urb_frame *frame;
+
+	tasklet_kill(&dec->urb_tasklet);
+
+	while ((item = dec->urb_frame_list.next) != &dec->urb_frame_list) {
+		frame = list_entry(item, struct urb_frame, urb_frame_list);
+		list_del(&frame->urb_frame_list);
+		kfree(frame);
+	}
+}
+
+static void ttusb_dec_init_filters(struct ttusb_dec *dec)
+{
+	INIT_LIST_HEAD(&dec->filter_info_list);
+	spin_lock_init(&dec->filter_info_list_lock);
+}
+
+static void ttusb_dec_exit_filters(struct ttusb_dec *dec)
+{
+	struct list_head *item;
+	struct filter_info *finfo;
+
+	while ((item = dec->filter_info_list.next) != &dec->filter_info_list) {
+		finfo = list_entry(item, struct filter_info, filter_info_list);
+		list_del(&finfo->filter_info_list);
+		kfree(finfo);
+	}
+}
+
+static int fe_send_command(struct dvb_frontend* fe, const u8 command,
+			   int param_length, const u8 params[],
+			   int *result_length, u8 cmd_result[])
+{
+	struct ttusb_dec* dec = fe->dvb->priv;
+	return ttusb_dec_send_command(dec, command, param_length, params, result_length, cmd_result);
+}
+
+static const struct ttusbdecfe_config fe_config = {
+	.send_command = fe_send_command
+};
+
+static int ttusb_dec_probe(struct usb_interface *intf,
+			   const struct usb_device_id *id)
+{
+	struct usb_device *udev;
+	struct ttusb_dec *dec;
+	int result;
+
+	dprintk("%s\n", __func__);
+
+	udev = interface_to_usbdev(intf);
+
+	if (!(dec = kzalloc(sizeof(struct ttusb_dec), GFP_KERNEL))) {
+		printk("%s: couldn't allocate memory.\n", __func__);
+		return -ENOMEM;
+	}
+
+	usb_set_intfdata(intf, (void *)dec);
+
+	switch (id->idProduct) {
+	case 0x1006:
+		ttusb_dec_set_model(dec, TTUSB_DEC3000S);
+		break;
+
+	case 0x1008:
+		ttusb_dec_set_model(dec, TTUSB_DEC2000T);
+		break;
+
+	case 0x1009:
+		ttusb_dec_set_model(dec, TTUSB_DEC2540T);
+		break;
+	}
+
+	dec->udev = udev;
+
+	result = ttusb_dec_init_usb(dec);
+	if (result)
+		goto err_usb;
+	result = ttusb_dec_init_stb(dec);
+	if (result)
+		goto err_stb;
+	result = ttusb_dec_init_dvb(dec);
+	if (result)
+		goto err_stb;
+
+	dec->adapter.priv = dec;
+	switch (id->idProduct) {
+	case 0x1006:
+		dec->fe = ttusbdecfe_dvbs_attach(&fe_config);
+		break;
+
+	case 0x1008:
+	case 0x1009:
+		dec->fe = ttusbdecfe_dvbt_attach(&fe_config);
+		break;
+	}
+
+	if (dec->fe == NULL) {
+		printk("dvb-ttusb-dec: A frontend driver was not found for device [%04x:%04x]\n",
+		       le16_to_cpu(dec->udev->descriptor.idVendor),
+		       le16_to_cpu(dec->udev->descriptor.idProduct));
+	} else {
+		if (dvb_register_frontend(&dec->adapter, dec->fe)) {
+			printk("budget-ci: Frontend registration failed!\n");
+			if (dec->fe->ops.release)
+				dec->fe->ops.release(dec->fe);
+			dec->fe = NULL;
+		}
+	}
+
+	ttusb_dec_init_v_pes(dec);
+	ttusb_dec_init_filters(dec);
+	ttusb_dec_init_tasklet(dec);
+
+	dec->active = 1;
+
+	ttusb_dec_set_interface(dec, TTUSB_DEC_INTERFACE_IN);
+
+	if (enable_rc)
+		ttusb_init_rc(dec);
+
+	return 0;
+err_stb:
+	ttusb_dec_exit_usb(dec);
+err_usb:
+	kfree(dec);
+	return result;
+}
+
+static void ttusb_dec_disconnect(struct usb_interface *intf)
+{
+	struct ttusb_dec *dec = usb_get_intfdata(intf);
+
+	usb_set_intfdata(intf, NULL);
+
+	dprintk("%s\n", __func__);
+
+	if (dec->active) {
+		ttusb_dec_exit_tasklet(dec);
+		ttusb_dec_exit_filters(dec);
+		if(enable_rc)
+			ttusb_dec_exit_rc(dec);
+		ttusb_dec_exit_usb(dec);
+		ttusb_dec_exit_dvb(dec);
+	}
+
+	kfree(dec);
+}
+
+static void ttusb_dec_set_model(struct ttusb_dec *dec,
+				enum ttusb_dec_model model)
+{
+	dec->model = model;
+
+	switch (model) {
+	case TTUSB_DEC2000T:
+		dec->model_name = "DEC2000-t";
+		dec->firmware_name = "dvb-ttusb-dec-2000t.fw";
+		break;
+
+	case TTUSB_DEC2540T:
+		dec->model_name = "DEC2540-t";
+		dec->firmware_name = "dvb-ttusb-dec-2540t.fw";
+		break;
+
+	case TTUSB_DEC3000S:
+		dec->model_name = "DEC3000-s";
+		dec->firmware_name = "dvb-ttusb-dec-3000s.fw";
+		break;
+	}
+}
+
+static struct usb_device_id ttusb_dec_table[] = {
+	{USB_DEVICE(0x0b48, 0x1006)},	/* DEC3000-s */
+	/*{USB_DEVICE(0x0b48, 0x1007)},	   Unconfirmed */
+	{USB_DEVICE(0x0b48, 0x1008)},	/* DEC2000-t */
+	{USB_DEVICE(0x0b48, 0x1009)},	/* DEC2540-t */
+	{}
+};
+
+static struct usb_driver ttusb_dec_driver = {
+	.name		= "ttusb-dec",
+	.probe		= ttusb_dec_probe,
+	.disconnect	= ttusb_dec_disconnect,
+	.id_table	= ttusb_dec_table,
+};
+
+module_usb_driver(ttusb_dec_driver);
+
+MODULE_AUTHOR("Alex Woods <linux-dvb@giblets.org>");
+MODULE_DESCRIPTION(DRIVER_NAME);
+MODULE_LICENSE("GPL");
+MODULE_DEVICE_TABLE(usb, ttusb_dec_table);
+>>>>>>> v4.13

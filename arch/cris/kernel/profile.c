@@ -5,7 +5,7 @@
 #include <linux/slab.h>
 #include <linux/types.h>
 #include <asm/ptrace.h>
-#include <asm/uaccess.h>
+#include <linux/uaccess.h>
 
 #define SAMPLE_BUFFER_SIZE 8192
 
@@ -76,7 +76,7 @@ static int __init init_cris_profile(void)
 	entry = proc_create("system_profile", S_IWUSR | S_IRUGO, NULL,
 			    &cris_proc_profile_operations);
 	if (entry) {
-		entry->size = SAMPLE_BUFFER_SIZE;
+		proc_set_size(entry, SAMPLE_BUFFER_SIZE);
 	}
 	prof_running = 1;
 

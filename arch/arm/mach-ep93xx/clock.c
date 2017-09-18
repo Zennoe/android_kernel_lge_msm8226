@@ -212,7 +212,7 @@ static struct clk_lookup clocks[] = {
 	INIT_CK(NULL,			"hclk",		&clk_h),
 	INIT_CK(NULL,			"apb_pclk",	&clk_p),
 	INIT_CK(NULL,			"pll2",		&clk_pll2),
-	INIT_CK("ep93xx-ohci",		NULL,		&clk_usb_host),
+	INIT_CK("ohci-platform",	NULL,		&clk_usb_host),
 	INIT_CK("ep93xx-keypad",	NULL,		&clk_keypad),
 	INIT_CK("ep93xx-fb",		NULL,		&clk_video),
 	INIT_CK("ep93xx-spi.0",		NULL,		&clk_spi),
@@ -474,6 +474,26 @@ int clk_set_rate(struct clk *clk, unsigned long rate)
 	return -EINVAL;
 }
 EXPORT_SYMBOL(clk_set_rate);
+
+long clk_round_rate(struct clk *clk, unsigned long rate)
+{
+	WARN_ON(clk);
+	return 0;
+}
+EXPORT_SYMBOL(clk_round_rate);
+
+int clk_set_parent(struct clk *clk, struct clk *parent)
+{
+	WARN_ON(clk);
+	return 0;
+}
+EXPORT_SYMBOL(clk_set_parent);
+
+struct clk *clk_get_parent(struct clk *clk)
+{
+	return clk->parent;
+}
+EXPORT_SYMBOL(clk_get_parent);
 
 
 static char fclk_divisors[] = { 1, 2, 4, 8, 16, 1, 1, 1 };

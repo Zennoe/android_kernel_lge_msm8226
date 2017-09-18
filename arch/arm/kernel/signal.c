@@ -11,9 +11,9 @@
 #include <linux/random.h>
 #include <linux/signal.h>
 #include <linux/personality.h>
-#include <linux/freezer.h>
 #include <linux/uaccess.h>
 #include <linux/tracehook.h>
+#include <linux/uprobes.h>
 
 #include <asm/elf.h>
 #include <asm/cacheflush.h>
@@ -21,97 +21,8 @@
 #include <asm/ucontext.h>
 #include <asm/unistd.h>
 #include <asm/vfp.h>
-#include "signal.h"
 
-#define _BLOCKABLE (~(sigmask(SIGKILL) | sigmask(SIGSTOP)))
-
-/*
- * For ARM syscalls, we encode the syscall number into the instruction.
- */
-#define SWI_SYS_SIGRETURN	(0xef000000|(__NR_sigreturn)|(__NR_OABI_SYSCALL_BASE))
-#define SWI_SYS_RT_SIGRETURN	(0xef000000|(__NR_rt_sigreturn)|(__NR_OABI_SYSCALL_BASE))
-#define SWI_SYS_RESTART		(0xef000000|__NR_restart_syscall|__NR_OABI_SYSCALL_BASE)
-
-/*
- * With EABI, the syscall number has to be loaded into r7.
- */
-#define MOV_R7_NR_SIGRETURN	(0xe3a07000 | (__NR_sigreturn - __NR_SYSCALL_BASE))
-#define MOV_R7_NR_RT_SIGRETURN	(0xe3a07000 | (__NR_rt_sigreturn - __NR_SYSCALL_BASE))
-
-/*
- * For Thumb syscalls, we pass the syscall number via r7.  We therefore
- * need two 16-bit instructions.
- */
-#define SWI_THUMB_SIGRETURN	(0xdf00 << 16 | 0x2700 | (__NR_sigreturn - __NR_SYSCALL_BASE))
-#define SWI_THUMB_RT_SIGRETURN	(0xdf00 << 16 | 0x2700 | (__NR_rt_sigreturn - __NR_SYSCALL_BASE))
-
-static const unsigned long sigreturn_codes[7] = {
-	MOV_R7_NR_SIGRETURN,    SWI_SYS_SIGRETURN,    SWI_THUMB_SIGRETURN,
-	MOV_R7_NR_RT_SIGRETURN, SWI_SYS_RT_SIGRETURN, SWI_THUMB_RT_SIGRETURN,
-};
-
-/*
- * Either we support OABI only, or we have EABI with the OABI
- * compat layer enabled.  In the later case we don't know if
- * user space is EABI or not, and if not we must not clobber r7.
- * Always using the OABI syscall solves that issue and works for
- * all those cases.
- */
-const unsigned long syscall_restart_code[2] = {
-	SWI_SYS_RESTART,	/* swi	__NR_restart_syscall */
-	0xe49df004,		/* ldr	pc, [sp], #4 */
-};
-
-/*
- * atomically swap in the new signal mask, and wait for a signal.
- */
-asmlinkage int sys_sigsuspend(int restart, unsigned long oldmask, old_sigset_t mask)
-{
-	sigset_t blocked;
-
-	current->saved_sigmask = current->blocked;
-
-	mask &= _BLOCKABLE;
-	siginitset(&blocked, mask);
-	set_current_blocked(&blocked);
-
-	current->state = TASK_INTERRUPTIBLE;
-	schedule();
-	set_restore_sigmask();
-	return -ERESTARTNOHAND;
-}
-
-asmlinkage int 
-sys_sigaction(int sig, const struct old_sigaction __user *act,
-	      struct old_sigaction __user *oact)
-{
-	struct k_sigaction new_ka, old_ka;
-	int ret;
-
-	if (act) {
-		old_sigset_t mask;
-		if (!access_ok(VERIFY_READ, act, sizeof(*act)) ||
-		    __get_user(new_ka.sa.sa_handler, &act->sa_handler) ||
-		    __get_user(new_ka.sa.sa_restorer, &act->sa_restorer))
-			return -EFAULT;
-		__get_user(new_ka.sa.sa_flags, &act->sa_flags);
-		__get_user(mask, &act->sa_mask);
-		siginitset(&new_ka.sa.sa_mask, mask);
-	}
-
-	ret = do_sigaction(sig, act ? &new_ka : NULL, oact ? &old_ka : NULL);
-
-	if (!ret && oact) {
-		if (!access_ok(VERIFY_WRITE, oact, sizeof(*oact)) ||
-		    __put_user(old_ka.sa.sa_handler, &oact->sa_handler) ||
-		    __put_user(old_ka.sa.sa_restorer, &oact->sa_restorer))
-			return -EFAULT;
-		__put_user(old_ka.sa.sa_flags, &oact->sa_flags);
-		__put_user(old_ka.sa.sa_mask.sig[0], &oact->sa_mask);
-	}
-
-	return ret;
-}
+extern const unsigned long sigreturn_codes[7];
 
 static unsigned long signal_return_offset;
 
@@ -129,8 +40,10 @@ static int preserve_crunch_context(struct crunch_sigframe __user *frame)
 	return __copy_to_user(frame, kframe, sizeof(*frame));
 }
 
-static int restore_crunch_context(struct crunch_sigframe __user *frame)
+static int restore_crunch_context(char __user **auxp)
 {
+	struct crunch_sigframe __user *frame =
+		(struct crunch_sigframe __user *)*auxp;
 	char kbuf[sizeof(*frame) + 8];
 	struct crunch_sigframe *kframe;
 
@@ -141,6 +54,7 @@ static int restore_crunch_context(struct crunch_sigframe __user *frame)
 	if (kframe->magic != CRUNCH_MAGIC ||
 	    kframe->size != CRUNCH_STORAGE_SIZE)
 		return -1;
+	*auxp += CRUNCH_STORAGE_SIZE;
 	crunch_task_restore(current_thread_info(), &kframe->storage);
 	return 0;
 }
@@ -148,21 +62,39 @@ static int restore_crunch_context(struct crunch_sigframe __user *frame)
 
 #ifdef CONFIG_IWMMXT
 
-static int preserve_iwmmxt_context(struct iwmmxt_sigframe *frame)
+static int preserve_iwmmxt_context(struct iwmmxt_sigframe __user *frame)
 {
 	char kbuf[sizeof(*frame) + 8];
 	struct iwmmxt_sigframe *kframe;
+	int err = 0;
 
 	/* the iWMMXt context must be 64 bit aligned */
 	kframe = (struct iwmmxt_sigframe *)((unsigned long)(kbuf + 8) & ~7);
-	kframe->magic = IWMMXT_MAGIC;
-	kframe->size = IWMMXT_STORAGE_SIZE;
-	iwmmxt_task_copy(current_thread_info(), &kframe->storage);
-	return __copy_to_user(frame, kframe, sizeof(*frame));
+
+	if (test_thread_flag(TIF_USING_IWMMXT)) {
+		kframe->magic = IWMMXT_MAGIC;
+		kframe->size = IWMMXT_STORAGE_SIZE;
+		iwmmxt_task_copy(current_thread_info(), &kframe->storage);
+
+		err = __copy_to_user(frame, kframe, sizeof(*frame));
+	} else {
+		/*
+		 * For bug-compatibility with older kernels, some space
+		 * has to be reserved for iWMMXt even if it's not used.
+		 * Set the magic and size appropriately so that properly
+		 * written userspace can skip it reliably:
+		 */
+		__put_user_error(DUMMY_MAGIC, &frame->magic, err);
+		__put_user_error(IWMMXT_STORAGE_SIZE, &frame->size, err);
+	}
+
+	return err;
 }
 
-static int restore_iwmmxt_context(struct iwmmxt_sigframe *frame)
+static int restore_iwmmxt_context(char __user **auxp)
 {
+	struct iwmmxt_sigframe __user *frame =
+		(struct iwmmxt_sigframe __user *)*auxp;
 	char kbuf[sizeof(*frame) + 8];
 	struct iwmmxt_sigframe *kframe;
 
@@ -170,10 +102,28 @@ static int restore_iwmmxt_context(struct iwmmxt_sigframe *frame)
 	kframe = (struct iwmmxt_sigframe *)((unsigned long)(kbuf + 8) & ~7);
 	if (__copy_from_user(kframe, frame, sizeof(*frame)))
 		return -1;
-	if (kframe->magic != IWMMXT_MAGIC ||
-	    kframe->size != IWMMXT_STORAGE_SIZE)
+
+	/*
+	 * For non-iWMMXt threads: a single iwmmxt_sigframe-sized dummy
+	 * block is discarded for compatibility with setup_sigframe() if
+	 * present, but we don't mandate its presence.  If some other
+	 * magic is here, it's not for us:
+	 */
+	if (!test_thread_flag(TIF_USING_IWMMXT) &&
+	    kframe->magic != DUMMY_MAGIC)
+		return 0;
+
+	if (kframe->size != IWMMXT_STORAGE_SIZE)
 		return -1;
-	iwmmxt_task_restore(current_thread_info(), &kframe->storage);
+
+	if (test_thread_flag(TIF_USING_IWMMXT)) {
+		if (kframe->magic != IWMMXT_MAGIC)
+			return -1;
+
+		iwmmxt_task_restore(current_thread_info(), &kframe->storage);
+	}
+
+	*auxp += IWMMXT_STORAGE_SIZE;
 	return 0;
 }
 
@@ -196,8 +146,10 @@ static int preserve_vfp_context(struct vfp_sigframe __user *frame)
 	return vfp_preserve_user_clear_hwstate(&frame->ufp, &frame->ufp_exc);
 }
 
-static int restore_vfp_context(struct vfp_sigframe __user *frame)
+static int restore_vfp_context(char __user **auxp)
 {
+	struct vfp_sigframe __user *frame =
+		(struct vfp_sigframe __user *)*auxp;
 	unsigned long magic;
 	unsigned long size;
 	int err = 0;
@@ -210,6 +162,7 @@ static int restore_vfp_context(struct vfp_sigframe __user *frame)
 	if (magic != VFP_MAGIC || size != VFP_STORAGE_SIZE)
 		return -EINVAL;
 
+	*auxp += size;
 	return vfp_restore_user_hwstate(&frame->ufp, &frame->ufp_exc);
 }
 
@@ -230,15 +183,13 @@ struct rt_sigframe {
 
 static int restore_sigframe(struct pt_regs *regs, struct sigframe __user *sf)
 {
-	struct aux_sigframe __user *aux;
+	char __user *aux;
 	sigset_t set;
 	int err;
 
 	err = __copy_from_user(&set, &sf->uc.uc_sigmask, sizeof(set));
-	if (err == 0) {
-		sigdelsetmask(&set, ~_BLOCKABLE);
+	if (err == 0)
 		set_current_blocked(&set);
-	}
 
 	__get_user_error(regs->ARM_r0, &sf->uc.uc_mcontext.arm_r0, err);
 	__get_user_error(regs->ARM_r1, &sf->uc.uc_mcontext.arm_r1, err);
@@ -260,18 +211,18 @@ static int restore_sigframe(struct pt_regs *regs, struct sigframe __user *sf)
 
 	err |= !valid_user_regs(regs);
 
-	aux = (struct aux_sigframe __user *) sf->uc.uc_regspace;
+	aux = (char __user *) sf->uc.uc_regspace;
 #ifdef CONFIG_CRUNCH
 	if (err == 0)
-		err |= restore_crunch_context(&aux->crunch);
+		err |= restore_crunch_context(&aux);
 #endif
 #ifdef CONFIG_IWMMXT
-	if (err == 0 && test_thread_flag(TIF_USING_IWMMXT))
-		err |= restore_iwmmxt_context(&aux->iwmmxt);
+	if (err == 0)
+		err |= restore_iwmmxt_context(&aux);
 #endif
 #ifdef CONFIG_VFP
 	if (err == 0)
-		err |= restore_vfp_context(&aux->vfp);
+		err |= restore_vfp_context(&aux);
 #endif
 
 	return err;
@@ -282,7 +233,7 @@ asmlinkage int sys_sigreturn(struct pt_regs *regs)
 	struct sigframe __user *frame;
 
 	/* Always make any pending restarted system calls return -EINTR */
-	current_thread_info()->restart_block.fn = do_no_restart_syscall;
+	current->restart_block.fn = do_no_restart_syscall;
 
 	/*
 	 * Since we stacked the signal on a 64-bit boundary,
@@ -312,7 +263,7 @@ asmlinkage int sys_rt_sigreturn(struct pt_regs *regs)
 	struct rt_sigframe __user *frame;
 
 	/* Always make any pending restarted system calls return -EINTR */
-	current_thread_info()->restart_block.fn = do_no_restart_syscall;
+	current->restart_block.fn = do_no_restart_syscall;
 
 	/*
 	 * Since we stacked the signal on a 64-bit boundary,
@@ -330,7 +281,7 @@ asmlinkage int sys_rt_sigreturn(struct pt_regs *regs)
 	if (restore_sigframe(regs, &frame->sig))
 		goto badframe;
 
-	if (do_sigaltstack(&frame->sig.uc.uc_stack, NULL, regs->ARM_sp) == -EFAULT)
+	if (restore_altstack(&frame->sig.uc.uc_stack))
 		goto badframe;
 
 	return regs->ARM_r0;
@@ -377,7 +328,7 @@ setup_sigframe(struct sigframe __user *sf, struct pt_regs *regs, sigset_t *set)
 		err |= preserve_crunch_context(&aux->crunch);
 #endif
 #ifdef CONFIG_IWMMXT
-	if (err == 0 && test_thread_flag(TIF_USING_IWMMXT))
+	if (err == 0)
 		err |= preserve_iwmmxt_context(&aux->iwmmxt);
 #endif
 #ifdef CONFIG_VFP
@@ -390,16 +341,10 @@ setup_sigframe(struct sigframe __user *sf, struct pt_regs *regs, sigset_t *set)
 }
 
 static inline void __user *
-get_sigframe(struct k_sigaction *ka, struct pt_regs *regs, int framesize)
+get_sigframe(struct ksignal *ksig, struct pt_regs *regs, int framesize)
 {
-	unsigned long sp = regs->ARM_sp;
+	unsigned long sp = sigsp(regs->ARM_sp, ksig);
 	void __user *frame;
-
-	/*
-	 * This is the X/Open sanctioned signal stack switching.
-	 */
-	if ((ka->sa.sa_flags & SA_ONSTACK) && !sas_ss_flags(sp))
-		sp = current->sas_ss_sp + current->sas_ss_size;
 
 	/*
 	 * ATPCS B01 mandates 8-byte alignment
@@ -416,10 +361,10 @@ get_sigframe(struct k_sigaction *ka, struct pt_regs *regs, int framesize)
 }
 
 static int
-setup_return(struct pt_regs *regs, struct k_sigaction *ka,
-	     unsigned long __user *rc, void __user *frame, int usig)
+setup_return(struct pt_regs *regs, struct ksignal *ksig,
+	     unsigned long __user *rc, void __user *frame)
 {
-	unsigned long handler = (unsigned long)ka->sa.sa_handler;
+	unsigned long handler = (unsigned long)ksig->ka.sa.sa_handler;
 	unsigned long retcode;
 	int thumb = 0;
 	unsigned long cpsr = regs->ARM_cpsr & ~(PSR_f | PSR_E_BIT);
@@ -429,7 +374,7 @@ setup_return(struct pt_regs *regs, struct k_sigaction *ka,
 	/*
 	 * Maybe we need to deliver a 32-bit signal to a 26-bit task.
 	 */
-	if (ka->sa.sa_flags & SA_THIRTYTWO)
+	if (ksig->ka.sa.sa_flags & SA_THIRTYTWO)
 		cpsr = (cpsr & ~MODE_MASK) | USR_MODE;
 
 #ifdef CONFIG_ARM_THUMB
@@ -440,15 +385,18 @@ setup_return(struct pt_regs *regs, struct k_sigaction *ka,
 		 */
 		thumb = handler & 1;
 
-#if __LINUX_ARM_ARCH__ >= 7
 		/*
-		 * Clear the If-Then Thumb-2 execution state
-		 * ARM spec requires this to be all 000s in ARM mode
-		 * Snapdragon S4/Krait misbehaves on a Thumb=>ARM
-		 * signal transition without this.
+		 * Clear the If-Then Thumb-2 execution state.  ARM spec
+		 * requires this to be all 000s in ARM mode.  Snapdragon
+		 * S4/Krait misbehaves on a Thumb=>ARM signal transition
+		 * without this.
+		 *
+		 * We must do this whenever we are running on a Thumb-2
+		 * capable CPU, which includes ARMv6T2.  However, we elect
+		 * to always do this to simplify the code; this field is
+		 * marked UNK/SBZP for older architectures.
 		 */
 		cpsr &= ~PSR_IT_MASK;
-#endif
 
 		if (thumb) {
 			cpsr |= PSR_T_BIT;
@@ -457,14 +405,18 @@ setup_return(struct pt_regs *regs, struct k_sigaction *ka,
 	}
 #endif
 
-	if (ka->sa.sa_flags & SA_RESTORER) {
-		retcode = (unsigned long)ka->sa.sa_restorer;
+	if (ksig->ka.sa.sa_flags & SA_RESTORER) {
+		retcode = (unsigned long)ksig->ka.sa.sa_restorer;
 	} else {
 		unsigned int idx = thumb << 1;
 
-		if (ka->sa.sa_flags & SA_SIGINFO)
+		if (ksig->ka.sa.sa_flags & SA_SIGINFO)
 			idx += 3;
 
+		/*
+		 * Put the sigreturn code on the stack no matter which return
+		 * mechanism we use in order to remain ABI compliant
+		 */
 		if (__put_user(sigreturn_codes[idx],   rc) ||
 		    __put_user(sigreturn_codes[idx+1], rc+1))
 			return 1;
@@ -494,7 +446,7 @@ setup_return(struct pt_regs *regs, struct k_sigaction *ka,
 		}
 	}
 
-	regs->ARM_r0 = usig;
+	regs->ARM_r0 = ksig->sig;
 	regs->ARM_sp = (unsigned long)frame;
 	regs->ARM_lr = retcode;
 	regs->ARM_pc = handler;
@@ -504,9 +456,9 @@ setup_return(struct pt_regs *regs, struct k_sigaction *ka,
 }
 
 static int
-setup_frame(int usig, struct k_sigaction *ka, sigset_t *set, struct pt_regs *regs)
+setup_frame(struct ksignal *ksig, sigset_t *set, struct pt_regs *regs)
 {
-	struct sigframe __user *frame = get_sigframe(ka, regs, sizeof(*frame));
+	struct sigframe __user *frame = get_sigframe(ksig, regs, sizeof(*frame));
 	int err = 0;
 
 	if (!frame)
@@ -519,36 +471,29 @@ setup_frame(int usig, struct k_sigaction *ka, sigset_t *set, struct pt_regs *reg
 
 	err |= setup_sigframe(frame, regs, set);
 	if (err == 0)
-		err = setup_return(regs, ka, frame->retcode, frame, usig);
+		err = setup_return(regs, ksig, frame->retcode, frame);
 
 	return err;
 }
 
 static int
-setup_rt_frame(int usig, struct k_sigaction *ka, siginfo_t *info,
-	       sigset_t *set, struct pt_regs *regs)
+setup_rt_frame(struct ksignal *ksig, sigset_t *set, struct pt_regs *regs)
 {
-	struct rt_sigframe __user *frame = get_sigframe(ka, regs, sizeof(*frame));
-	stack_t stack;
+	struct rt_sigframe __user *frame = get_sigframe(ksig, regs, sizeof(*frame));
 	int err = 0;
 
 	if (!frame)
 		return 1;
 
-	err |= copy_siginfo_to_user(&frame->info, info);
+	err |= copy_siginfo_to_user(&frame->info, &ksig->info);
 
 	__put_user_error(0, &frame->sig.uc.uc_flags, err);
 	__put_user_error(NULL, &frame->sig.uc.uc_link, err);
 
-	memset(&stack, 0, sizeof(stack));
-	stack.ss_sp = (void __user *)current->sas_ss_sp;
-	stack.ss_flags = sas_ss_flags(regs->ARM_sp);
-	stack.ss_size = current->sas_ss_size;
-	err |= __copy_to_user(&frame->sig.uc.uc_stack, &stack, sizeof(stack));
-
+	err |= __save_altstack(&frame->sig.uc.uc_stack, regs->ARM_sp);
 	err |= setup_sigframe(&frame->sig, regs, set);
 	if (err == 0)
-		err = setup_return(regs, ka, frame->sig.retcode, frame, usig);
+		err = setup_return(regs, ksig, frame->sig.retcode, frame);
 
 	if (err == 0) {
 		/*
@@ -566,46 +511,25 @@ setup_rt_frame(int usig, struct k_sigaction *ka, siginfo_t *info,
 /*
  * OK, we're invoking a handler
  */	
-static int
-handle_signal(unsigned long sig, struct k_sigaction *ka,
-	      siginfo_t *info, sigset_t *oldset,
-	      struct pt_regs * regs)
+static void handle_signal(struct ksignal *ksig, struct pt_regs *regs)
 {
-	struct thread_info *thread = current_thread_info();
-	struct task_struct *tsk = current;
-	int usig = sig;
+	sigset_t *oldset = sigmask_to_save();
 	int ret;
-
-	/*
-	 * translate the signal
-	 */
-	if (usig < 32 && thread->exec_domain && thread->exec_domain->signal_invmap)
-		usig = thread->exec_domain->signal_invmap[usig];
 
 	/*
 	 * Set up the stack frame
 	 */
-	if (ka->sa.sa_flags & SA_SIGINFO)
-		ret = setup_rt_frame(usig, ka, info, oldset, regs);
+	if (ksig->ka.sa.sa_flags & SA_SIGINFO)
+		ret = setup_rt_frame(ksig, oldset, regs);
 	else
-		ret = setup_frame(usig, ka, oldset, regs);
+		ret = setup_frame(ksig, oldset, regs);
 
 	/*
 	 * Check that the resulting registers are actually sane.
 	 */
 	ret |= !valid_user_regs(regs);
 
-	if (ret != 0) {
-		force_sigsegv(sig, tsk);
-		return ret;
-	}
-
-	/*
-	 * Block the signal if we were successful.
-	 */
-	block_sigmask(ka, sig);
-
-	return 0;
+	signal_setup_done(ret, ksig, 0);
 }
 
 /*
@@ -617,21 +541,11 @@ handle_signal(unsigned long sig, struct k_sigaction *ka,
  * the kernel can handle, and then we build all the user-level signal handling
  * stack-frames in one go after that.
  */
-static void do_signal(struct pt_regs *regs, int syscall)
+static int do_signal(struct pt_regs *regs, int syscall)
 {
 	unsigned int retval = 0, continue_addr = 0, restart_addr = 0;
-	struct k_sigaction ka;
-	siginfo_t info;
-	int signr;
-
-	/*
-	 * We want the common case to go fast, which
-	 * is why we may in certain cases get here from
-	 * kernel mode. Just return without doing anything
-	 * if so.
-	 */
-	if (!user_mode(regs))
-		return;
+	struct ksignal ksig;
+	int restart = 0;
 
 	/*
 	 * If we were from a system call, check for system call restarting...
@@ -646,91 +560,88 @@ static void do_signal(struct pt_regs *regs, int syscall)
 		 * debugger will see the already changed PSW.
 		 */
 		switch (retval) {
+		case -ERESTART_RESTARTBLOCK:
+			restart -= 2;
 		case -ERESTARTNOHAND:
 		case -ERESTARTSYS:
 		case -ERESTARTNOINTR:
-		case -ERESTART_RESTARTBLOCK:
+			restart++;
 			regs->ARM_r0 = regs->ARM_ORIG_r0;
 			regs->ARM_pc = restart_addr;
 			break;
 		}
 	}
 
-	if (try_to_freeze())
-		goto no_signal;
-
 	/*
 	 * Get the signal to deliver.  When running under ptrace, at this
 	 * point the debugger may change all our registers ...
 	 */
-	signr = get_signal_to_deliver(&info, &ka, regs, NULL);
-	if (signr > 0) {
-		sigset_t *oldset;
-
-		/*
-		 * Depending on the signal settings we may need to revert the
-		 * decision to restart the system call.  But skip this if a
-		 * debugger has chosen to restart at a different PC.
-		 */
-		if (regs->ARM_pc == restart_addr) {
+	/*
+	 * Depending on the signal settings we may need to revert the
+	 * decision to restart the system call.  But skip this if a
+	 * debugger has chosen to restart at a different PC.
+	 */
+	if (get_signal(&ksig)) {
+		/* handler */
+		if (unlikely(restart) && regs->ARM_pc == restart_addr) {
 			if (retval == -ERESTARTNOHAND ||
 			    retval == -ERESTART_RESTARTBLOCK
 			    || (retval == -ERESTARTSYS
-				&& !(ka.sa.sa_flags & SA_RESTART))) {
+				&& !(ksig.ka.sa.sa_flags & SA_RESTART))) {
 				regs->ARM_r0 = -EINTR;
 				regs->ARM_pc = continue_addr;
 			}
-			clear_thread_flag(TIF_SYSCALL_RESTARTSYS);
 		}
-
-		if (test_thread_flag(TIF_RESTORE_SIGMASK))
-			oldset = &current->saved_sigmask;
-		else
-			oldset = &current->blocked;
-		if (handle_signal(signr, &ka, &info, oldset, regs) == 0) {
-			/*
-			 * A signal was successfully delivered; the saved
-			 * sigmask will have been stored in the signal frame,
-			 * and will be restored by sigreturn, so we can simply
-			 * clear the TIF_RESTORE_SIGMASK flag.
-			 */
-			if (test_thread_flag(TIF_RESTORE_SIGMASK))
-				clear_thread_flag(TIF_RESTORE_SIGMASK);
+		handle_signal(&ksig, regs);
+	} else {
+		/* no handler */
+		restore_saved_sigmask();
+		if (unlikely(restart) && regs->ARM_pc == restart_addr) {
+			regs->ARM_pc = continue_addr;
+			return restart;
 		}
-		return;
 	}
-
- no_signal:
-	if (syscall) {
-		/*
-		 * Handle restarting a different system call.  As above,
-		 * if a debugger has chosen to restart at a different PC,
-		 * ignore the restart.
-		 */
-		if (retval == -ERESTART_RESTARTBLOCK
-		    && regs->ARM_pc == restart_addr)
-			set_thread_flag(TIF_SYSCALL_RESTARTSYS);
-	}
-
-	/* If there's no signal to deliver, we just put the saved sigmask
-	 * back.
-	 */
-	if (test_and_clear_thread_flag(TIF_RESTORE_SIGMASK))
-		set_current_blocked(&current->saved_sigmask);
+	return 0;
 }
 
-asmlinkage void
-do_notify_resume(struct pt_regs *regs, unsigned int thread_flags, int syscall)
+asmlinkage int
+do_work_pending(struct pt_regs *regs, unsigned int thread_flags, int syscall)
 {
-	if (thread_flags & _TIF_SIGPENDING)
-		do_signal(regs, syscall);
-
-	if (thread_flags & _TIF_NOTIFY_RESUME) {
-		clear_thread_flag(TIF_NOTIFY_RESUME);
-		tracehook_notify_resume(regs);
-		if (current->replacement_session_keyring)
-			key_replace_session_keyring();
-	}
+	/*
+	 * The assembly code enters us with IRQs off, but it hasn't
+	 * informed the tracing code of that for efficiency reasons.
+	 * Update the trace code with the current status.
+	 */
+	trace_hardirqs_off();
+	do {
+		if (likely(thread_flags & _TIF_NEED_RESCHED)) {
+			schedule();
+		} else {
+			if (unlikely(!user_mode(regs)))
+				return 0;
+			local_irq_enable();
+			if (thread_flags & _TIF_SIGPENDING) {
+				int restart = do_signal(regs, syscall);
+				if (unlikely(restart)) {
+					/*
+					 * Restart without handlers.
+					 * Deal with it without leaving
+					 * the kernel space.
+					 */
+					return restart;
+				}
+				syscall = 0;
+			} else if (thread_flags & _TIF_UPROBE) {
+				uprobe_notify_resume(regs);
+			} else {
+				clear_thread_flag(TIF_NOTIFY_RESUME);
+				tracehook_notify_resume(regs);
+			}
+		}
+		local_irq_disable();
+		thread_flags = current_thread_info()->flags;
+	} while (thread_flags & _TIF_WORK_MASK);
+	return 0;
 }
 
 struct page *get_signal_page(void)

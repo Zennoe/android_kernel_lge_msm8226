@@ -167,7 +167,7 @@ static struct parisc_device_id zalon_tbl[] = {
 
 MODULE_DEVICE_TABLE(parisc, zalon_tbl);
 
-static int __exit zalon_remove(struct parisc_device *dev)
+static int zalon_remove(struct parisc_device *dev)
 {
 	struct Scsi_Host *host = dev_get_drvdata(&dev->dev);
 
@@ -182,7 +182,7 @@ static struct parisc_driver zalon_driver = {
 	.name =		"zalon",
 	.id_table =	zalon_tbl,
 	.probe =	zalon_probe,
-	.remove =	__devexit_p(zalon_remove),
+	.remove =	zalon_remove,
 };
 
 static int __init zalon7xx_init(void)

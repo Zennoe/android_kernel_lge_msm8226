@@ -1,7 +1,13 @@
 /*
+<<<<<<< HEAD
  * Skeleton device tree; the bare minimum needed to boot; just include and
  * add a compatible value.  The bootloader will typically populate the memory
  * node.
+=======
+ * Skeleton device tree in the 64 bits version; the bare minimum
+ * needed to boot; just include and add a compatible value.  The
+ * bootloader will typically populate the memory node.
+>>>>>>> v4.13
  */
 
 / {
@@ -9,10 +15,14 @@
 	#size-cells = <2>;
 	chosen { };
 	aliases { };
+<<<<<<< HEAD
 	memory {
 		#address-cells = <2>;
 		#size-cells = <2>;
 		device_type = "memory";
 		reg = <0 0 0 0>;
 	};
+=======
+	memory { device_type = "memory"; reg = <0 0 0 0>; };
+>>>>>>> v4.13
 };

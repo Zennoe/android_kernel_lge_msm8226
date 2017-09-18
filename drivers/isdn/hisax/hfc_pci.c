@@ -354,7 +354,7 @@ receive_dmsg(struct IsdnCardState *cs)
 		if ((rcnt > MAX_DFRAME_LEN + 3) || (rcnt < 4) ||
 		    (df->data[zp->z1])) {
 			if (cs->debug & L1_DEB_WARN)
-				debugl1(cs, "empty_fifo hfcpci paket inv. len %d or crc %d", rcnt, df->data[zp->z1]);
+				debugl1(cs, "empty_fifo hfcpci packet inv. len %d or crc %d", rcnt, df->data[zp->z1]);
 #ifdef ERROR_STATISTIC
 			cs->err_rx++;
 #endif
@@ -1582,9 +1582,7 @@ inithfcpci(struct IsdnCardState *cs)
 	cs->bcs[1].BC_SetStack = setstack_2b;
 	cs->bcs[0].BC_Close = close_hfcpci;
 	cs->bcs[1].BC_Close = close_hfcpci;
-	cs->dbusytimer.function = (void *) hfcpci_dbusy_timer;
-	cs->dbusytimer.data = (long) cs;
-	init_timer(&cs->dbusytimer);
+	setup_timer(&cs->dbusytimer, (void *)hfcpci_dbusy_timer, (long)cs);
 	mode_hfcpci(cs->bcs, 0, 0);
 	mode_hfcpci(cs->bcs + 1, 0, 1);
 }
@@ -1632,9 +1630,9 @@ hfcpci_card_msg(struct IsdnCardState *cs, int mt, void *arg)
 
 
 /* this variable is used as card index when more than one cards are present */
-static struct pci_dev *dev_hfcpci __devinitdata = NULL;
+static struct pci_dev *dev_hfcpci = NULL;
 
-int __devinit
+int
 setup_hfcpci(struct IsdnCard *card)
 {
 	u_long flags;
@@ -1642,10 +1640,6 @@ setup_hfcpci(struct IsdnCard *card)
 	char tmp[64];
 	int i;
 	struct pci_dev *tmp_hfcpci = NULL;
-
-#ifdef __BIG_ENDIAN
-#error "not running on big endian machines now"
-#endif
 
 	strcpy(tmp, hfcpci_revision);
 	printk(KERN_INFO "HiSax: HFC-PCI driver Rev. %s\n", HiSax_getrev(tmp));
@@ -1750,9 +1744,7 @@ setup_hfcpci(struct IsdnCard *card)
 	cs->BC_Write_Reg = NULL;
 	cs->irq_func = &hfcpci_interrupt;
 	cs->irq_flags |= IRQF_SHARED;
-	cs->hw.hfcpci.timer.function = (void *) hfcpci_Timer;
-	cs->hw.hfcpci.timer.data = (long) cs;
-	init_timer(&cs->hw.hfcpci.timer);
+	setup_timer(&cs->hw.hfcpci.timer, (void *)hfcpci_Timer, (long)cs);
 	cs->cardmsg = &hfcpci_card_msg;
 	cs->auxcmd = &hfcpci_auxcmd;
 

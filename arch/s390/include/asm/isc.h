@@ -14,9 +14,12 @@
 /* Regular I/O interrupts. */
 #define IO_SCH_ISC 3			/* regular I/O subchannels */
 #define CONSOLE_ISC 1			/* console I/O subchannel */
+#define EADM_SCH_ISC 4			/* EADM subchannels */
 #define CHSC_SCH_ISC 7			/* CHSC subchannels */
+#define VFIO_CCW_ISC IO_SCH_ISC		/* VFIO-CCW I/O subchannels */
 /* Adapter interrupts. */
 #define QDIO_AIRQ_ISC IO_SCH_ISC	/* I/O subchannel in qdio mode */
+#define PCI_ISC 2			/* PCI I/O subchannels */
 #define AP_ISC 6			/* adjunct processor (crypto) devices */
 
 /* Functions for registration of I/O interruption subclasses */

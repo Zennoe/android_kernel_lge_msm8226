@@ -5,4 +5,10 @@
 #else
 #include <asm/uaccess_32.h>
 #endif
+
+#define user_addr_max() \
+	(uaccess_kernel() ? ~0UL : TASK_SIZE)
+
+long strncpy_from_user(char *dest, const char __user *src, long count);
+
 #endif
